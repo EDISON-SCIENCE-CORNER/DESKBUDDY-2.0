@@ -24,8 +24,8 @@ public:
       cfg.dma_channel = SPI_DMA_CH_AUTO;
 
       // XIAO ESP32S3 default SPI pins
-      cfg.pin_sclk = 7;               // D8  (SCK)
-      cfg.pin_mosi = 9;               // D10 (MOSI)
+      cfg.pin_sclk = 7;               // D8  (SCL)
+      cfg.pin_mosi = 9;               // D10 (SDA)
       cfg.pin_miso = -1;              // not used
       cfg.pin_dc   = 4;               // D4  (DC)
 
