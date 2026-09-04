@@ -7,7 +7,17 @@
 #include <Preferences.h>
 #include "time.h"
 
-// ===== Display configuration for XIAO ESP32S3 + ST7789 240x240 =====
+// ===== Hardware Pin Configuration for Waveshare ESP32-S3-Zero =====
+// Having GPIO 10, 11, 12, 13, 14 sequentially in a row makes wiring extremely clean.
+constexpr int SPI_SCLK_PIN = 12; // GP12 (SCK / SCL)
+constexpr int SPI_MOSI_PIN = 11; // GP11 (MOSI / SDA)
+constexpr int SPI_MISO_PIN = -1; // Not used
+constexpr int SPI_CS_PIN   = 10; // GP10 (CS)
+constexpr int SPI_DC_PIN   = 14; // GP14 (DC / A0)
+constexpr int SPI_RST_PIN  = 13; // GP13 (RES / RST)
+constexpr int TOUCH_PIN    = 1;  // GP1 (Touch sensor digital input)
+
+// ===== Display configuration for ESP32-S3 Zero + ST7789 240x240 =====
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ST7789 _panel;
   lgfx::Bus_SPI      _bus;
@@ -23,11 +33,10 @@ public:
       cfg.use_lock   = true;
       cfg.dma_channel = SPI_DMA_CH_AUTO;
 
-      // XIAO ESP32S3 default SPI pins
-      cfg.pin_sclk = 7;               // D8  (SCL)
-      cfg.pin_mosi = 9;               // D10 (SDA)
-      cfg.pin_miso = -1;              // not used
-      cfg.pin_dc   = 4;               // D4  (DC)
+      cfg.pin_sclk = SPI_SCLK_PIN;
+      cfg.pin_mosi = SPI_MOSI_PIN;
+      cfg.pin_miso = SPI_MISO_PIN;
+      cfg.pin_dc   = SPI_DC_PIN;
 
       _bus.config(cfg);
       _panel.setBus(&_bus);
@@ -35,8 +44,8 @@ public:
 
     { // Panel config
       auto cfg = _panel.config();
-      cfg.pin_cs   = 2;               // D2 (CS)
-      cfg.pin_rst  = 3;               // D3 (RST)
+      cfg.pin_cs   = SPI_CS_PIN;
+      cfg.pin_rst  = SPI_RST_PIN;
       cfg.pin_busy = -1;
 
       cfg.memory_width  = 240;
@@ -64,8 +73,10 @@ const int16_t CX_LEFT  = 70;
 const int16_t CX_RIGHT = 170;
 const int16_t CY       = 110;
 
-const int16_t EYE_W      = 80;
-const int16_t EYE_H      = 80;
+// Sprite dimensions for rendering
+const int16_t EYE_SPRITE_W = 100;
+const int16_t EYE_SPRITE_H = 100;
+
 const int16_t PUPIL_SIZE = 36;
 const int16_t SCLERA_PAD = 6;
 
@@ -87,10 +98,74 @@ const uint16_t EYE_COLOURS[NUM_EYE_COLOURS] = {
 };
 int currentEyeColourIndex = 0;
 
-// Touch input
-const int TOUCH_PIN = 1;          // GPIO 1 touch sensor
-const unsigned long DOUBLE_TAP_MS = 1000;  // max time between taps to count as double-tap
-unsigned long lastTapTime = 0;
+// ===== Mood & Physics Animation Engine =====
+#define MOOD_NORMAL    0
+#define MOOD_HAPPY     1
+#define MOOD_SURPRISED 2
+#define MOOD_SLEEPY    3
+#define MOOD_ANGRY     4
+#define MOOD_SAD       5
+#define MOOD_EXCITED   6
+#define MOOD_LOVE      7
+#define MOOD_SUSPICIOUS 8
+#define MOOD_HEART     9
+int currentMood = MOOD_NORMAL;
+
+struct Eye {
+  float x, y;
+  float w, h;
+  float targetX, targetY, targetW, targetH;
+
+  float pupilX, pupilY;
+  float targetPupilX, targetPupilY;
+
+  float velX, velY, velW, velH;
+  float pVelX, pVelY;
+  float k = 0.12f;
+  float d = 0.60f;
+  float pk = 0.08f;
+  float pd = 0.50f;
+
+  bool blinking;
+  unsigned long lastBlink;
+  unsigned long nextBlinkTime;
+
+  void init(float _x, float _y, float _w, float _h) {
+    x = targetX = _x;
+    y = targetY = _y;
+    w = targetW = _w;
+    h = targetH = _h;
+    pupilX = targetPupilX = 0;
+    pupilY = targetPupilY = 0;
+    nextBlinkTime = millis() + random(1000, 4000);
+  }
+
+  void update() {
+    float ax = (targetX - x) * k;
+    float ay = (targetY - y) * k;
+    float aw = (targetW - w) * k;
+    float ah = (targetH - h) * k;
+
+    velX = (velX + ax) * d;
+    velY = (velY + ay) * d;
+    velW = (velW + aw) * d;
+    velH = (velH + ah) * d;
+
+    x += velX;
+    y += velY;
+    w += velW;
+    h += velH;
+
+    float pax = (targetPupilX - pupilX) * pk;
+    float pay = (targetPupilY - pupilY) * pk;
+    pVelX = (pVelX + pax) * pd;
+    pVelY = (pVelY + pay) * pd;
+    pupilX += pVelX;
+    pupilY += pVelY;
+  }
+};
+
+Eye leftEye, rightEye;
 
 // ===== Config (WiFi, OpenWeather, timezone) via web portal =====
 #define PREF_NAMESPACE   "cb"
@@ -139,20 +214,13 @@ int currentPage  = 0;
 int lastPage     = -1;
 
 // Touch debounce & gestures
-bool lastTouchState      = false;
-unsigned long lastTouchTime = 0;
-const unsigned long TOUCH_DEBOUNCE_MS = 200;
-
-const unsigned long LONG_PRESS_MS = 800;
-bool roundEyeMode       = false;  // long-press on eyes page toggles round eyes
-unsigned long touchDownTime = 0;
-bool touchDownValid     = false;
+bool roundEyeMode       = false;  // triple-tap on eyes page toggles round eyes
 
 // Info-page redraw throttle
 unsigned long lastInfoRedrawMs = 0;
-
-// Animation
-float angle = 0.0f;
+int lastClockMin = -1;
+unsigned long lastWeatherPageDrawMs = 0;
+unsigned long lastForecastPageDrawMs = 0;
 
 // Single sprite reused for both eyes
 lgfx::LGFX_Sprite eyeSprite(&lcd);
@@ -295,43 +363,253 @@ void startConfigAP() {
   configMode = true;
 }
 
-// ===== Eye drawing =====
-// roundEye = true -> circular eye, false -> rounded-rect eye
-void drawEyeToSprite(int16_t offX, int16_t offY, bool roundEye) {
+// ===== Eye drawing & masking =====
+void drawEyelidMask(float x, float y, float w, float h, int mood, bool isLeft) {
+  if (mood == MOOD_HEART) return; // Full heart symbol visible
+
+  int ix = (int)x;
+  int iy = (int)y;
+  int iw = (int)w;
+  int ih = (int)h;
+
+  if (mood == MOOD_ANGRY) {
+    if (isLeft) {
+      for (int i = 0; i < 30; i++) {
+        eyeSprite.drawLine(ix - 5, iy + i - 15, ix + iw + 5, iy + i - 30, BLACK);
+      }
+    } else {
+      for (int i = 0; i < 30; i++) {
+        eyeSprite.drawLine(ix - 5, iy + i - 30, ix + iw + 5, iy + i - 15, BLACK);
+      }
+    }
+  }
+  else if (mood == MOOD_SAD) {
+    if (isLeft) {
+      for (int i = 0; i < 30; i++) {
+        eyeSprite.drawLine(ix - 5, iy + i - 30, ix + iw + 5, iy + i - 15, BLACK);
+      }
+    } else {
+      for (int i = 0; i < 30; i++) {
+        eyeSprite.drawLine(ix - 5, iy + i - 15, ix + iw + 5, iy + i - 30, BLACK);
+      }
+    }
+  }
+  else if (mood == MOOD_HAPPY || mood == MOOD_LOVE || mood == MOOD_EXCITED) {
+    eyeSprite.fillRect(ix - 5, iy + ih - 24, iw + 10, 30, BLACK);
+    eyeSprite.fillCircle(ix + iw / 2, iy + ih + 12, iw / 1.3f, BLACK);
+  }
+  else if (mood == MOOD_SLEEPY) {
+    eyeSprite.fillRect(ix - 5, iy - 5, iw + 10, ih / 2 + 4, BLACK);
+  }
+  else if (mood == MOOD_SUSPICIOUS) {
+    if (isLeft) {
+      eyeSprite.fillRect(ix - 5, iy - 5, iw + 10, ih / 2 - 4, BLACK);
+    } else {
+      eyeSprite.fillRect(ix - 5, iy + ih - 16, iw + 10, 20, BLACK);
+    }
+  }
+}
+
+void drawHeartToSprite(int x, int y, int size, uint16_t color) {
+  int r = size / 4;
+  eyeSprite.fillCircle(x - r, y - r/2, r, color);
+  eyeSprite.fillCircle(x + r, y - r/2, r, color);
+  eyeSprite.fillTriangle(x - 2 * r, y - r/2, x + 2 * r, y - r/2, x, y + size/2, color);
+}
+
+void drawEyeToSprite(Eye& e, bool isLeft, bool roundEye) {
   eyeSprite.fillScreen(BLACK);
   uint16_t eyeColour = EYE_COLOURS[currentEyeColourIndex];
 
-  int16_t halfW = EYE_W / 2;
-  int16_t halfH = EYE_H / 2;
+  int ix = (int)e.x;
+  int iy = (int)e.y;
+  int iw = (int)e.w;
+  int ih = (int)e.h;
 
-  if (roundEye) {
-    int16_t radius = halfW;   // 40, fits in 80x80
-    eyeSprite.fillCircle(halfW, halfH, radius, eyeColour);
+  int r = 16;
+  if (iw < 40) r = 6;
+
+  // 1. Draw Sclera
+  if (currentMood == MOOD_HEART) {
+    drawHeartToSprite(ix + iw / 2, iy + ih / 2, iw, eyeColour);
+  } else if (roundEye) {
+    eyeSprite.fillEllipse(ix + iw / 2, iy + ih / 2, iw / 2, ih / 2, eyeColour);
   } else {
-    eyeSprite.fillRoundRect(0, 0, EYE_W, EYE_H, 10, eyeColour);
+    eyeSprite.fillRoundRect(ix, iy, iw, ih, r, eyeColour);
   }
 
-  // Pupil center & clamp
-  int16_t cx = halfW + offX;
-  int16_t cy = halfH + offY;
-  int16_t minCX = SCLERA_PAD + PUPIL_SIZE / 2;
-  int16_t maxCX = EYE_W - SCLERA_PAD - PUPIL_SIZE / 2;
-  int16_t minCY = SCLERA_PAD + PUPIL_SIZE / 2;
-  int16_t maxCY = EYE_H - SCLERA_PAD - PUPIL_SIZE / 2;
+  // 2. Draw Pupil (Skip for MOOD_HEART)
+  if (currentMood != MOOD_HEART) {
+    int cx = ix + iw / 2;
+    int cy = iy + ih / 2;
+    int pw = (int)(iw / 2.2f);
+    int ph = (int)(ih / 2.2f);
+    int px = cx + (int)e.pupilX - (pw / 2);
+    int py = cy + (int)e.pupilY - (ph / 2);
 
-  if (cx < minCX) cx = minCX;
-  if (cx > maxCX) cx = maxCX;
-  if (cy < minCY) cy = minCY;
-  if (cy > maxCY) cy = maxCY;
+    int minPX = ix + SCLERA_PAD;
+    int maxPX = ix + iw - SCLERA_PAD - pw;
+    int minPY = iy + SCLERA_PAD;
+    int maxPY = iy + ih - SCLERA_PAD - ph;
+    if (px < minPX) px = minPX;
+    if (px > maxPX) px = maxPX;
+    if (py < minPY) py = minPY;
+    if (py > maxPY) py = maxPY;
 
-  int16_t pupilR = PUPIL_SIZE / 2;  // 18
+    if (roundEye) {
+      eyeSprite.fillEllipse(px + pw / 2, py + ph / 2, pw / 2, ph / 2, BLACK);
+    } else {
+      eyeSprite.fillRoundRect(px, py, pw, ph, r / 2, BLACK);
+    }
 
-  if (roundEye) {
-    eyeSprite.fillCircle(cx, cy, pupilR, BLACK);
+    // 3. Draw Reflection Highlight
+    if (iw > 30 && ih > 30) {
+      eyeSprite.fillCircle(px + pw - 8, py + 8, 4, WHITE);
+    }
   } else {
-    eyeSprite.fillRoundRect(cx - pupilR, cy - pupilR, PUPIL_SIZE, PUPIL_SIZE, 6, BLACK);
+    // 3. Draw Reflection Highlight on Heart Eyeball
+    if (iw > 30 && ih > 30) {
+      eyeSprite.fillCircle(ix + iw / 2 + iw / 5, iy + ih / 2 - ih / 5, iw / 10, WHITE);
+    }
   }
+
+  // 4. Draw Eyelids
+  drawEyelidMask(e.x, e.y, e.w, e.h, currentMood, isLeft);
 }
+
+// ===== Floating Particles & Helpers =====
+void drawHeart(int x, int y, int size, uint16_t color) {
+  int r = size / 4;
+  lcd.fillCircle(x - r, y - r, r, color);
+  lcd.fillCircle(x + r, y - r, r, color);
+  lcd.fillTriangle(x - 2 * r, y - r/2, x + 2 * r, y - r/2, x, y + size/2, color);
+}
+
+void drawZZZ(int x, int y, int step) {
+  lcd.setTextColor(WHITE, BLACK);
+  lcd.setTextSize(2);
+  lcd.setCursor(x, y);
+  lcd.print("z");
+  lcd.setTextSize(3);
+  lcd.setCursor(x + 15, y - 12);
+  lcd.print("Z");
+  lcd.setTextSize(4);
+  lcd.setCursor(x + 35, y - 28);
+  lcd.print("Z");
+}
+
+void drawAngerMark(int x, int y, int r, uint16_t color) {
+  lcd.drawFastHLine(x - r, y - r/2, 2*r, color);
+  lcd.drawFastHLine(x - r, y + r/2, 2*r, color);
+  lcd.drawFastVLine(x - r/2, y - r, 2*r, color);
+  lcd.drawFastVLine(x + r/2, y - r, 2*r, color);
+}
+
+// Saccade & physics globals
+unsigned long lastSaccade = 0;
+unsigned long saccadeInterval = 3000;
+float breathVal = 0.0f;
+
+void updatePhysicsAndMood() {
+  unsigned long now = millis();
+  breathVal = sinf(now / 800.0f) * 3.0f;
+
+  if (now > leftEye.nextBlinkTime) {
+    leftEye.blinking  = true;
+    leftEye.lastBlink = now;
+    rightEye.blinking = true;
+    leftEye.nextBlinkTime = now + random(2000, 6000);
+  }
+  if (leftEye.blinking) {
+    leftEye.targetH  = 4;
+    rightEye.targetH = 4;
+    if (now - leftEye.lastBlink > 120) {
+      leftEye.blinking  = false;
+      rightEye.blinking = false;
+    }
+  }
+
+  static float lx = 0.0f, ly = 0.0f;
+  if (!leftEye.blinking && now - lastSaccade > saccadeInterval) {
+    lastSaccade    = now;
+    saccadeInterval = random(500, 3000);
+    int dir = random(0, 10);
+    lx = 0; ly = 0;
+    if      (dir == 4) { lx = -6; ly = -4; }
+    else if (dir == 5) { lx = 6;  ly = -4; }
+    else if (dir == 6) { lx = -6; ly = 4; }
+    else if (dir == 7) { lx = 6;  ly = 4; }
+    else if (dir == 8) { lx = 8;  ly = 0; }
+    else if (dir == 9) { lx = -8; ly = 0; }
+    
+    leftEye.targetPupilX  = lx * 2.0f;
+    leftEye.targetPupilY  = ly * 2.0f;
+    rightEye.targetPupilX = lx * 2.0f;
+    rightEye.targetPupilY = ly * 2.0f;
+  }
+
+  if (!leftEye.blinking) {
+    float baseW = 80.0f;
+    float baseH = 80.0f + breathVal;
+    switch (currentMood) {
+      case MOOD_NORMAL:
+        leftEye.targetW  = baseW;  leftEye.targetH  = baseH;
+        rightEye.targetW = baseW;  rightEye.targetH = baseH;
+        break;
+      case MOOD_HAPPY:
+      case MOOD_LOVE:
+        leftEye.targetW  = 90.0f;  leftEye.targetH  = 70.0f;
+        rightEye.targetW = 90.0f;  rightEye.targetH = 70.0f;
+        break;
+      case MOOD_SURPRISED:
+        leftEye.targetW  = 68.0f;  leftEye.targetH  = 100.0f;
+        rightEye.targetW = 68.0f;  rightEye.targetH = 100.0f;
+        break;
+      case MOOD_SLEEPY:
+        leftEye.targetW  = 84.0f;  leftEye.targetH  = 66.0f;
+        rightEye.targetW = 84.0f;  rightEye.targetH = 66.0f;
+        break;
+      case MOOD_ANGRY:
+        leftEye.targetW  = 76.0f;  leftEye.targetH  = 70.0f;
+        rightEye.targetW = 76.0f;  rightEye.targetH = 70.0f;
+        break;
+      case MOOD_SAD:
+        leftEye.targetW  = 76.0f;  leftEye.targetH  = 90.0f;
+        rightEye.targetW = 76.0f;  rightEye.targetH = 90.0f;
+        break;
+      case MOOD_EXCITED:
+        leftEye.targetW  = 94.0f;  leftEye.targetH  = 94.0f;
+        rightEye.targetW = 94.0f;  rightEye.targetH = 94.0f;
+        break;
+      case MOOD_SUSPICIOUS:
+        leftEye.targetW  = 80.0f;  leftEye.targetH  = 44.0f;
+        rightEye.targetW = 80.0f;  rightEye.targetH = 94.0f;
+        break;
+      case MOOD_HEART:
+        leftEye.targetW  = 86.0f;  leftEye.targetH  = 86.0f + breathVal;
+        rightEye.targetW = 86.0f;  rightEye.targetH = 86.0f + breathVal;
+        break;
+    }
+  }
+
+  leftEye.targetX  = (100.0f - leftEye.targetW) / 2.0f + lx * 0.7f;
+  leftEye.targetY  = (100.0f - leftEye.targetH) / 2.0f + ly * 0.7f;
+  rightEye.targetX = (100.0f - rightEye.targetW) / 2.0f + lx * 0.7f;
+  rightEye.targetY = (100.0f - rightEye.targetH) / 2.0f + ly * 0.7f;
+
+  leftEye.update();
+  rightEye.update();
+}
+
+void updateMoodBasedOnWeather() {
+  if      (weatherMain == "Clear")                              currentMood = MOOD_HAPPY;
+  else if (weatherMain == "Rain" || weatherMain == "Drizzle")   currentMood = MOOD_SAD;
+  else if (weatherMain == "Thunderstorm")                       currentMood = MOOD_SURPRISED;
+  else if (currentTemp > 35.0f)                                 currentMood = MOOD_EXCITED;
+  else if (currentTemp < 5.0f)                                  currentMood = MOOD_SLEEPY;
+  else                                                          currentMood = MOOD_NORMAL;
+}
+
 
 // ===== Networking & data =====
 void fetchWeather() {
@@ -361,6 +639,7 @@ void fetchWeather() {
       if (weatherDesc.length() > 0) {
         weatherDesc[0] = toupper(weatherDesc[0]);
       }
+      updateMoodBasedOnWeather();
     }
   }
   http.end();
@@ -503,7 +782,10 @@ void setup() {
   lcd.clear(BLACK);
 
   eyeSprite.setColorDepth(16);
-  eyeSprite.createSprite(EYE_W, EYE_H);
+  eyeSprite.createSprite(100, 100);
+
+  leftEye.init(10, 10, 80, 80);
+  rightEye.init(10, 10, 80, 80);
 
   pinMode(TOUCH_PIN, INPUT);
 
@@ -581,84 +863,122 @@ void loop() {
     return;
   }
 
-  angle += 0.02f;          // adjust for speed; lower = slower
-  if (angle > TWO_PI) angle -= TWO_PI;
-
-  float maxOffsetX = (EYE_W / 2.0f) - SCLERA_PAD - (PUPIL_SIZE / 2.0f);
-  float maxOffsetY = (EYE_H / 2.0f) - SCLERA_PAD - (PUPIL_SIZE / 2.0f);
-
-  int16_t offX = (int16_t)(cosf(angle) * maxOffsetX);
-  int16_t offY = (int16_t)(sinf(angle * 0.5f) * maxOffsetY);
-
   // Web config: handle requests when connected
   server.handleClient();
 
-  // Periodically refresh weather
   unsigned long nowMs = millis();
+
+  // Periodically refresh weather
   if (nowMs - lastWeatherUpdate > WEATHER_INTERVAL_MS) {
     fetchWeather();
     lastWeatherUpdate = nowMs;
   }
 
-  // Touch: on DOWN record time; on UP decide long-press vs double-tap vs single tap
-  bool touch = digitalRead(TOUCH_PIN);
-  if (touch && !lastTouchState && (nowMs - lastTouchTime > TOUCH_DEBOUNCE_MS)) {
-    touchDownTime = nowMs;
-    touchDownValid = true;
+  // Gesture handling: single tap, double tap, triple tap, and long press
+  static int tapCounter = 0;
+  static unsigned long lastTapTime = 0;
+  static bool lastPinState = false;
+  static unsigned long pressStartTime = 0;
+  static bool isLongPressHandled = false;
+
+  const unsigned long LONG_PRESS_TIME = 800;
+  const unsigned long DOUBLE_TAP_DELAY = 400;
+
+  bool currentPinState = digitalRead(TOUCH_PIN);
+
+  if (currentPinState && !lastPinState) {
+    pressStartTime = nowMs;
+    isLongPressHandled = false;
+  } else if (currentPinState && lastPinState) {
+    if ((nowMs - pressStartTime > LONG_PRESS_TIME) && !isLongPressHandled) {
+      if (currentPage == 0) {
+        currentMood = (currentMood + 1) % 10;
+        lastSaccade = 0; // Look straight initially on mood change
+      }
+      isLongPressHandled = true;
+    }
+  } else if (!currentPinState && lastPinState) {
+    if ((nowMs - pressStartTime < LONG_PRESS_TIME) && !isLongPressHandled) {
+      tapCounter++;
+      lastTapTime = nowMs;
+    }
   }
-  if (!touch && lastTouchState && touchDownValid) {
-    unsigned long duration = nowMs - touchDownTime;
-    if (duration >= LONG_PRESS_MS && currentPage == 0) {
-      // Long-press on eyes page: toggle round eye animation
-      roundEyeMode = !roundEyeMode;
-    } else {
-      // Short release = tap: double-tap = cycle colour, else advance page
-      if (lastTapTime != 0 && (touchDownTime - lastTapTime) <= DOUBLE_TAP_MS) {
+  lastPinState = currentPinState;
+
+  if (tapCounter > 0) {
+    if (nowMs - lastTapTime > DOUBLE_TAP_DELAY) {
+      if (tapCounter == 1) {
+        // Single tap: cycle page
+        currentPage = (currentPage + 1) % 4;
+      } else if (tapCounter == 2) {
+        // Double tap: cycle color
         currentEyeColourIndex = (currentEyeColourIndex + 1) % NUM_EYE_COLOURS;
         saveEyeColour();
-      } else {
-        currentPage = (currentPage + 1) % 4;
+      } else if (tapCounter >= 3) {
+        // Triple tap: toggle round vs rounded-rect mode
+        roundEyeMode = !roundEyeMode;
       }
-      lastTapTime = touchDownTime;
+      tapCounter = 0;
     }
-    lastTouchTime = nowMs;
-    touchDownValid = false;
   }
-  lastTouchState = touch;
 
   // Draw current page content
   if (currentPage == 0) {
-    // Eyes page: round or rounded-rect eyes depending on long-press
+    // Eyes page with smooth physics animations
     if (lastPage != 0) {
       lcd.clear(BLACK);
     }
-    drawEyeToSprite(offX, offY, roundEyeMode);
-    eyeSprite.pushSprite(CX_LEFT - EYE_W / 2, CY - EYE_H / 2);
-    drawEyeToSprite(offX, offY, roundEyeMode);
-    eyeSprite.pushSprite(CX_RIGHT - EYE_W / 2, CY - EYE_H / 2);
+    
+    // Update physics variables
+    updatePhysicsAndMood();
+
+    // Draw floating particles if applicable
+    if (currentMood == MOOD_LOVE) {
+      drawHeart(120, 45, 24, 0xF800); // Center red heart
+      drawHeart(50, 45, 12, 0xF800);  // Left red heart
+      drawHeart(190, 45, 12, 0xF800); // Right red heart
+    } else if (currentMood == MOOD_SLEEPY) {
+      drawZZZ(110, 45, 0); // ZZZ in the middle
+    } else if (currentMood == MOOD_ANGRY) {
+      drawAngerMark(45, 40, 8, 0xF800);  // Anger mark left
+      drawAngerMark(195, 40, 8, 0xF800); // Anger mark right
+    }
+
+    // Render left eye
+    drawEyeToSprite(leftEye, true, roundEyeMode);
+    eyeSprite.pushSprite(CX_LEFT - 50, CY - 50);
+
+    // Render right eye
+    drawEyeToSprite(rightEye, false, roundEyeMode);
+    eyeSprite.pushSprite(CX_RIGHT - 50, CY - 50);
+
   } else if (currentPage == 1) {
     // Clock
-    if (currentPage != lastPage) {
-      lcd.clear(BLACK);
-    }
-    if (currentPage != lastPage || nowMs - lastInfoRedrawMs > 1000) {
+    struct tm timeinfo;
+    bool hasTime = getLocalTime(&timeinfo);
+    if (currentPage != lastPage || 
+        (hasTime && timeinfo.tm_min != lastClockMin) || 
+        (!hasTime && nowMs - lastInfoRedrawMs > 1000)) {
       drawClockPage();
       lastInfoRedrawMs = nowMs;
+      if (hasTime) {
+        lastClockMin = timeinfo.tm_min;
+      }
     }
   } else if (currentPage == 2) {
     // Weather
-    if (currentPage != lastPage || nowMs - lastInfoRedrawMs > 2000) {
+    if (currentPage != lastPage || lastWeatherPageDrawMs != lastWeatherUpdate) {
       drawWeatherPage();
-      lastInfoRedrawMs = nowMs;
+      lastWeatherPageDrawMs = lastWeatherUpdate;
     }
   } else {
     // Forecast
-    if (currentPage != lastPage || nowMs - lastInfoRedrawMs > 5000) {
+    if (currentPage != lastPage || lastForecastPageDrawMs != lastWeatherUpdate) {
       drawForecastPage();
-      lastInfoRedrawMs = nowMs;
+      lastForecastPageDrawMs = lastWeatherUpdate;
     }
   }
 
   lastPage = currentPage;
-  delay(20);
+  delay(16); // ~60fps target animation loop rate
 }
